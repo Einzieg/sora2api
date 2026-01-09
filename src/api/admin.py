@@ -95,8 +95,8 @@ class UpdateTokenRequest(BaseModel):
     video_concurrency: Optional[int] = None  # Video concurrency limit
 
 class ImportTokenItem(BaseModel):
-    email: str  # Email (primary key)
-    access_token: str  # Access Token (AT)
+    email: str  # Email (primary key, required)
+    access_token: Optional[str] = None  # Access Token (AT, optional for st/rt modes)
     session_token: Optional[str] = None  # Session Token (ST)
     refresh_token: Optional[str] = None  # Refresh Token (RT)
     client_id: Optional[str] = None  # Client ID (optional, for compatibility)
@@ -110,6 +110,7 @@ class ImportTokenItem(BaseModel):
 
 class ImportTokensRequest(BaseModel):
     tokens: List[ImportTokenItem]
+    mode: str = "at"  # Import mode: offline/at/st/rt
 
 class UpdateAdminConfigRequest(BaseModel):
     error_ban_threshold: int
@@ -349,7 +350,8 @@ async def delete_token(token_id: int, token: str = Depends(verify_admin_token)):
 
 @router.post("/api/tokens/import")
 async def import_tokens(request: ImportTokensRequest, token: str = Depends(verify_admin_token)):
-    """Import tokens in append mode (update if exists, add if not)"""
+    """Import tokens with different modes: offline/at/st/rt"""
+    mode = request.mode  # offline/at/st/rt
     added_count = 0
     updated_count = 0
     failed_count = 0
@@ -357,14 +359,64 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
 
     for import_item in request.tokens:
         try:
-            # Check if token with this email already exists
+            # Step 1: Get or convert access_token based on mode
+            access_token = None
+            skip_status = False
+
+            if mode == "offline":
+                # Offline mode: use provided AT, skip status update
+                if not import_item.access_token:
+                    raise ValueError("离线导入模式需要提供 access_token")
+                access_token = import_item.access_token
+                skip_status = True
+
+            elif mode == "at":
+                # AT mode: use provided AT, update status (current logic)
+                if not import_item.access_token:
+                    raise ValueError("AT导入模式需要提供 access_token")
+                access_token = import_item.access_token
+                skip_status = False
+
+            elif mode == "st":
+                # ST mode: convert ST to AT, update status
+                if not import_item.session_token:
+                    raise ValueError("ST导入模式需要提供 session_token")
+                # Convert ST to AT
+                st_result = await token_manager.st_to_at(import_item.session_token)
+                access_token = st_result["access_token"]
+                # Update email if API returned it
+                if "email" in st_result and st_result["email"]:
+                    import_item.email = st_result["email"]
+                skip_status = False
+
+            elif mode == "rt":
+                # RT mode: convert RT to AT, update status
+                if not import_item.refresh_token:
+                    raise ValueError("RT导入模式需要提供 refresh_token")
+                # Convert RT to AT
+                rt_result = await token_manager.rt_to_at(
+                    import_item.refresh_token,
+                    client_id=import_item.client_id
+                )
+                access_token = rt_result["access_token"]
+                # Update RT if API returned new one
+                if "refresh_token" in rt_result and rt_result["refresh_token"]:
+                    import_item.refresh_token = rt_result["refresh_token"]
+                # Update email if API returned it
+                if "email" in rt_result and rt_result["email"]:
+                    import_item.email = rt_result["email"]
+                skip_status = False
+            else:
+                raise ValueError(f"不支持的导入模式: {mode}")
+
+            # Step 2: Check if token with this email already exists
             existing_token = await db.get_token_by_email(import_item.email)
 
             if existing_token:
                 # Update existing token
                 await token_manager.update_token(
                     token_id=existing_token.id,
-                    token=import_item.access_token,
+                    token=access_token,
                     st=import_item.session_token,
                     rt=import_item.refresh_token,
                     client_id=import_item.client_id,
@@ -373,7 +425,8 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
                     image_enabled=import_item.image_enabled,
                     video_enabled=import_item.video_enabled,
                     image_concurrency=import_item.image_concurrency,
-                    video_concurrency=import_item.video_concurrency
+                    video_concurrency=import_item.video_concurrency,
+                    skip_status_update=skip_status
                 )
                 # Update active status
                 await token_manager.update_token_status(existing_token.id, import_item.is_active)
@@ -393,7 +446,7 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
             else:
                 # Add new token
                 new_token = await token_manager.add_token(
-                    token_value=import_item.access_token,
+                    token_value=access_token,
                     st=import_item.session_token,
                     rt=import_item.refresh_token,
                     client_id=import_item.client_id,
@@ -403,7 +456,9 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
                     image_enabled=import_item.image_enabled,
                     video_enabled=import_item.video_enabled,
                     image_concurrency=import_item.image_concurrency,
-                    video_concurrency=import_item.video_concurrency
+                    video_concurrency=import_item.video_concurrency,
+                    skip_status_update=skip_status,
+                    email=import_item.email  # Pass email for offline mode
                 )
                 # Set active status
                 if not import_item.is_active:
@@ -432,7 +487,7 @@ async def import_tokens(request: ImportTokensRequest, token: str = Depends(verif
 
     return {
         "success": True,
-        "message": f"Import completed: {added_count} added, {updated_count} updated, {failed_count} failed",
+        "message": f"Import completed ({mode} mode): {added_count} added, {updated_count} updated, {failed_count} failed",
         "added": added_count,
         "updated": updated_count,
         "failed": failed_count,
