@@ -2,12 +2,14 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from datetime import datetime
-from typing import List
+from pathlib import Path
+from typing import List, Optional
+import base64
 import json
 import re
 import time
 from ..core.auth import verify_api_key_header
-from ..core.models import ChatCompletionRequest
+from ..core.models import ChatCompletionRequest, ImageGenerationRequest
 from ..services.generation_handler import GenerationHandler, MODEL_CONFIG
 from ..core.logger import debug_logger
 
@@ -15,11 +17,116 @@ router = APIRouter()
 
 # Dependency injection will be set up in main.py
 generation_handler: GenerationHandler = None
+IMAGE_MODEL_ALIASES = {
+    "gpt-image-1": "gpt-image",
+    "dall-e-3": "gpt-image",
+    "dall-e-2": "gpt-image"
+}
 
 def set_generation_handler(handler: GenerationHandler):
     """Set generation handler instance"""
     global generation_handler
     generation_handler = handler
+
+def _build_error_response(message: str, error_type: str = "server_error", code: Optional[str] = None) -> dict:
+    """Build OpenAI-compatible error response"""
+    return {
+        "error": {
+            "message": message,
+            "type": error_type,
+            "param": None,
+            "code": code
+        }
+    }
+
+def _resolve_image_model(model: Optional[str], size: Optional[str]) -> str:
+    """Resolve image model from request model or size"""
+    if model:
+        mapped_model = IMAGE_MODEL_ALIASES.get(model, model)
+        model_config = MODEL_CONFIG.get(mapped_model)
+        if not model_config or model_config.get("type") != "image":
+            raise ValueError(f"Invalid image model: {model}")
+        return mapped_model
+
+    if size:
+        match = re.match(r"^\s*(\d+)\s*x\s*(\d+)\s*$", size.lower())
+        if match:
+            width = int(match.group(1))
+            height = int(match.group(2))
+            if width > height:
+                return "gpt-image-landscape"
+            if height > width:
+                return "gpt-image-portrait"
+
+    return "gpt-image"
+
+def _extract_image_urls(markdown_content: str) -> List[str]:
+    """Extract generated image URLs from markdown content"""
+    if not markdown_content:
+        return []
+
+    urls = re.findall(r"!\[[^\]]*\]\(([^)\s]+)\)", markdown_content)
+    if not urls:
+        urls = re.findall(r"https?://[^\s)]+", markdown_content)
+
+    deduplicated = []
+    for url in urls:
+        if url not in deduplicated:
+            deduplicated.append(url)
+    return deduplicated
+
+async def _generate_image_urls(model: str, prompt: str) -> List[str]:
+    """Run image generation in streaming mode and collect final URLs"""
+    content_chunks = []
+
+    async for chunk in generation_handler.handle_generation_with_retry(
+        model=model,
+        prompt=prompt,
+        image=None,
+        video=None,
+        remix_target_id=None,
+        stream=True
+    ):
+        if not isinstance(chunk, str) or not chunk.startswith("data: "):
+            continue
+
+        payload = chunk[6:].strip()
+        if payload == "[DONE]":
+            break
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        if isinstance(data, dict) and "error" in data:
+            error_data = data.get("error", {})
+            error_msg = error_data.get("message") or "Image generation failed"
+            raise Exception(error_msg)
+
+        for choice in data.get("choices", []):
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            if content:
+                content_chunks.append(content)
+
+    image_urls = _extract_image_urls("".join(content_chunks))
+    if not image_urls:
+        raise Exception("Image generation completed but no image URL was returned")
+
+    return image_urls
+
+async def _image_url_to_base64(url: str) -> str:
+    """Convert image URL to base64"""
+    if "/tmp/" in url:
+        filename = url.split("/tmp/", 1)[1].split("?", 1)[0].split("#", 1)[0]
+        filename = Path(filename).name
+        local_file = Path("tmp") / filename
+        if local_file.exists():
+            return base64.b64encode(local_file.read_bytes()).decode("utf-8")
+
+    image_bytes = await generation_handler._download_file(url)
+    return base64.b64encode(image_bytes).decode("utf-8")
 
 def _extract_remix_id(text: str) -> str:
     """Extract remix ID from text
@@ -69,6 +176,91 @@ async def list_models(api_key: str = Depends(verify_api_key_header)):
         "object": "list",
         "data": models
     }
+
+@router.post("/v1/images/generations")
+async def create_image_generation(
+    request: ImageGenerationRequest,
+    api_key: str = Depends(verify_api_key_header),
+    http_request: Request = None
+):
+    """OpenAI-compatible image generation endpoint"""
+    start_time = time.time()
+
+    try:
+        debug_logger.log_request(
+            method="POST",
+            url="/v1/images/generations",
+            headers=dict(http_request.headers) if http_request else {},
+            body=request.dict(),
+            source="Client"
+        )
+
+        prompt = (request.prompt or "").strip()
+        if not prompt:
+            raise ValueError("Prompt cannot be empty")
+
+        if request.n is not None and request.n < 1:
+            raise ValueError("Parameter n must be greater than 0")
+
+        # The upstream Sora image flow generates one task result per request.
+        if request.n and request.n > 1:
+            raise ValueError("This service currently supports n=1 only")
+
+        response_format = (request.response_format or "url").lower()
+        if response_format not in ("url", "b64_json"):
+            raise ValueError(f"Unsupported response_format: {request.response_format}")
+
+        model = _resolve_image_model(request.model, request.size)
+        image_urls = await _generate_image_urls(model=model, prompt=prompt)
+
+        if response_format == "b64_json":
+            data = [{"b64_json": await _image_url_to_base64(url)} for url in image_urls]
+        else:
+            data = [{"url": url} for url in image_urls]
+
+        response_data = {
+            "created": int(datetime.now().timestamp()),
+            "data": data
+        }
+
+        duration_ms = (time.time() - start_time) * 1000
+        debug_logger.log_response(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            body=response_data,
+            duration_ms=duration_ms,
+            source="Client"
+        )
+        return JSONResponse(content=response_data)
+
+    except ValueError as e:
+        duration_ms = (time.time() - start_time) * 1000
+        error_response = _build_error_response(str(e), error_type="invalid_request_error")
+        debug_logger.log_response(
+            status_code=400,
+            headers={"Content-Type": "application/json"},
+            body=error_response,
+            duration_ms=duration_ms,
+            source="Client"
+        )
+        return JSONResponse(status_code=400, content=error_response)
+    except Exception as e:
+        duration_ms = (time.time() - start_time) * 1000
+        error_response = _build_error_response(str(e))
+        debug_logger.log_error(
+            error_message=str(e),
+            status_code=500,
+            response_text=str(e),
+            source="Client"
+        )
+        debug_logger.log_response(
+            status_code=500,
+            headers={"Content-Type": "application/json"},
+            body=error_response,
+            duration_ms=duration_ms,
+            source="Client"
+        )
+        return JSONResponse(status_code=500, content=error_response)
 
 @router.post("/v1/chat/completions")
 async def create_chat_completion(

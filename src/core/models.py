@@ -181,6 +181,14 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     max_tokens: Optional[int] = None
 
+class ImageGenerationRequest(BaseModel):
+    prompt: str
+    model: Optional[str] = None
+    n: Optional[int] = 1
+    size: Optional[str] = None
+    response_format: Optional[str] = "url"
+    user: Optional[str] = None
+
 class ChatCompletionChoice(BaseModel):
     index: int
     message: Optional[dict] = None
